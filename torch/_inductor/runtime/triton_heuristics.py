@@ -4702,6 +4702,115 @@ def _maybe_filter_configs_for_tma_restrictions(
     return configs
 
 
+# (XBLOCK, num_warps) candidates of a one-dimensional kernel on a capped grid, with the warp
+# counts for 32-lane GPUs (halved on 64-lane ones, for the same threads per program). Each
+# program loops over many x blocks, and a large block keeps enough loads in flight. The
+# values come from one H100 measurement, a bf16-to-fp16 cast at 44 and 66 programs; other
+# GPUs use them untimed.
+CAPPED_GRID_POINTWISE_CANDIDATES = (
+    (16384, 16),
+    (16384, 32),
+    (32768, 8),
+    (32768, 16),
+    (65536, 8),
+)
+
+
+def _capped_grid_pointwise_configs(
+    size_hints: dict[str, int],
+    inductor_meta: InductorMeta,
+    triton_meta: TritonMeta,
+    min_elem_per_thread: int = 0,
+) -> list[Config]:
+    """The configs of a one-dimensional kernel launched on a capped grid (at most
+    `inductor_meta["grid_cap"]` programs that loop over its x blocks): the candidates whose
+    XBLOCK is at most both `grid_max_xblock` (default `TRITON_MAX_BLOCK["X"]`) and the size
+    hint. If no candidate fits, one config whose XBLOCK is the smaller of the two limits, with
+    one warp per 128 elements (at least one). Warp counts are for 32-lane GPUs and halved on
+    64-lane ones; on every GPU, each is capped so that a program fits the device's maximum
+    threads per block. As in `triton_config`, XBLOCK is raised to give each thread at least
+    `min_elem_per_thread` elements, but not past the size hint. With Inductor's
+    `min_elem_per_thread` (at most 4), the raise takes XBLOCK past `grid_max_xblock` only
+    when that limit is below 256 elements. Only the first config is used when pointwise
+    autotuning is off and max-autotune is not on. Empty for every other kernel.
+    """
+    if not inductor_meta.get("grid_cap") or len(size_hints) != 1:
+        return []
+    device = triton_meta["device"]
+    warp_size = device.warp_size_or_default
+    max_warps = max(1, (device.max_threads_per_block or 1024) // warp_size)
+    max_xblock = min(
+        inductor_meta.get("grid_max_xblock", TRITON_MAX_BLOCK["X"]), size_hints["x"]
+    )
+    candidates = [
+        (xblock, num_warps)
+        for xblock, num_warps in CAPPED_GRID_POINTWISE_CANDIDATES
+        if xblock <= max_xblock
+    ] or [(max_xblock, max_xblock // 128)]
+    if not inductor_meta.get("autotune_pointwise", True) and not (
+        inductor_meta.get("max_autotune") or inductor_meta.get("max_autotune_pointwise")
+    ):
+        candidates = candidates[:1]
+    # Halve the warps on 64-lane GPUs (down to one) for the same threads per program
+    warp_scale = max(1, warp_size // 32)
+    configs = []
+    for xblock, num_warps in candidates:
+        num_warps = max(1, min(num_warps // warp_scale, max_warps))
+        xblock = min(
+            max(xblock, min_elem_per_thread * warp_size * num_warps), size_hints["x"]
+        )
+        configs.append(Config({"XBLOCK": xblock}, num_warps=num_warps, num_stages=1))
+    return unique_configs(configs)
+
+
+def _capped_grid_reduction_configs(
+    size_hints: dict[str, int], inductor_meta: InductorMeta, triton_meta: TritonMeta
+) -> list[Config]:
+    """Extra candidates of a looped reduction launched on a capped grid (at most
+    `inductor_meta["grid_cap"]` programs that loop over its rows): XBLOCK 1 with R0_BLOCK
+    4,096 for rows wider than 2,048 elements and 8,192 for rows wider than 4,096 (the row's
+    size hint, a power of 2, is at least the block), with 16 warps on 32-lane GPUs (8 on
+    64-lane ones). Like the pointwise candidates, they keep more loads in flight in each
+    iteration of a program's loop. Empty if the reduction is tiled in x and y, its rows are
+    strided (the OUTER and OUTER_TINY hints), it has more than one reduction dimension, it
+    is register-intensive (an x size hint of at least 1,024 and at least 10 loads and
+    reductions, the stock heuristic's condition for an R0_BLOCK limit of 1,024 and a halved
+    warp limit) or its configs are filtered for determinism (deterministic mode keeps one
+    config without a benchmark, which could then be one of these untimed candidates), and
+    for every other kernel.
+    """
+    if (
+        not inductor_meta.get("grid_cap")
+        or "y" in size_hints
+        or "r1_" in size_hints
+        or inductor_meta.get("reduction_hint")
+        in (ReductionHint.OUTER, ReductionHint.OUTER_TINY)
+        # the stock reduction heuristic's register-intensive condition
+        or (
+            size_hints["x"] >= 1024
+            and inductor_meta.get("num_load", 0) + inductor_meta.get("num_reduction", 0)
+            >= 10
+        )
+        # the conditions of filter_reduction_configs_for_determinism
+        or inductor_meta.get("deterministic", False)
+        or inductor_meta.get("force_filter_reduction_configs", False)
+        or inductor_meta.get("are_deterministic_algorithms_enabled", False)
+    ):
+        return []
+    rnumel = get_total_reduction_numel(size_hints)
+    return [
+        triton_config_reduction(
+            size_hints,
+            1,
+            r0_block,
+            num_warps=16,
+            warp_size=triton_meta["device"].warp_size_or_default,
+        )
+        for r0_block in (4096, 8192)
+        if rnumel >= r0_block
+    ]
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4755,14 +4864,20 @@ def pointwise(
     from torch._inductor.heuristics.registry import get_codegen_heuristic
 
     pointwise_heuristic = get_codegen_heuristic("pointwise", triton_meta["device"].type)
-    configs = pointwise_heuristic.get_configs(
-        size_hints,
-        bs,
-        triton_config_with_settings,
-        hinted_configs,
-        tile_hint=tile_hint,
-        inductor_meta=inductor_meta,
+    # A kernel on a capped grid autotunes over its own candidates: with the default CUDA
+    # blocks (at most 1,024 elements), each program's loop keeps too few loads in flight.
+    configs = _capped_grid_pointwise_configs(
+        size_hints, inductor_meta, triton_meta, min_elem_per_thread
     )
+    if not configs:
+        configs = pointwise_heuristic.get_configs(
+            size_hints,
+            bs,
+            triton_config_with_settings,
+            hinted_configs,
+            tile_hint=tile_hint,
+            inductor_meta=inductor_meta,
+        )
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     if return_configs:
@@ -4851,6 +4966,8 @@ def _reduction_configs(
         triton_meta=triton_meta,
         num_dynamic=num_dynamic,
     )
+    if capped := _capped_grid_reduction_configs(size_hints, inductor_meta, triton_meta):
+        configs = unique_configs([*configs, *capped])
     r0 = inductor_meta.get("strict_reduction_rblock")
     if r0 is not None:
         configs = copy.deepcopy(configs)
@@ -5407,6 +5524,19 @@ class GridExpr:
         cpp_items = [f"(long){x}" if isinstance(x, int) else str(x) for x in items]
         return functools.reduce(lambda x, y: f"std::max({x}, {y})", cpp_items)
 
+    def minimum(self, seq: list[int | str]) -> int | str:
+        """Codegen for min function with constant folding, constants are represented as int"""
+        items = self._constant_fold(min, seq)
+        if len(items) <= 1:
+            return items[0]
+        if self.mode == "python":
+            return f"min({', '.join(map(str, items))})"
+        # std::min deduces one type: cast every item, constants and expressions, to long
+        cpp_items = [
+            f"(long){x}" if isinstance(x, int) else f"(long)({x})" for x in items
+        ]
+        return functools.reduce(lambda x, y: f"std::min({x}, {y})", cpp_items)
+
     def summation(self, seq: list[int | str]) -> int | str:
         """Codegen for sum function with constant folding, constants are represented as int"""
         items = self._constant_fold(sum, seq)
@@ -5501,6 +5631,17 @@ class GridExpr:
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+
+
+class CappedGrid1D(GridExpr):
+    """Grid1D capped at `inductor_meta["grid_cap"]` programs, for a kernel whose programs
+    loop over its x blocks."""
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        cap = int(self.inductor_meta["grid_cap"])
+        if cap < 1:
+            raise AssertionError(f"grid_cap must be at least 1, got {cap}")
+        self.x_grid = self.minimum([self.ceildiv("xnumel", meta.get("XBLOCK")), cap])
 
 
 class Grid2D(GridExpr):

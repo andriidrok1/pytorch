@@ -1520,6 +1520,345 @@ class TestGridExprMaximum(TestCase):
         self.assertEqual(grid.maximum([10, 20, 5]), 20)
 
 
+class TestGridExprMinimum(TestCase):
+    def test_minimum_constant_folds(self):
+        from torch._inductor.runtime.triton_heuristics import Grid1D
+
+        grid = Grid1D(inductor_meta={}, mode="python")
+        self.assertEqual(grid.minimum([10, 20, 5]), 5)
+        self.assertEqual(grid.minimum(["xnumel"]), "xnumel")
+        # Int constants fold into one, after the symbolic items
+        self.assertEqual(grid.minimum(["xnumel", 66, 128]), "min(xnumel, 66)")
+
+    def test_minimum_cpp_mode_casts_every_item_to_long(self):
+        from torch._inductor.runtime.triton_heuristics import Grid1D
+
+        grid = Grid1D(inductor_meta={}, mode="cpp")
+        # std::min needs one argument type: cast constants and expressions alike
+        self.assertEqual(
+            grid.minimum(["xnumel", 66, 128]), "std::min((long)(xnumel), (long)66)"
+        )
+        self.assertEqual(
+            grid.minimum(["a", "b + 1"]), "std::min((long)(a), (long)(b + 1))"
+        )
+
+
+class TestCappedGrid1D(TestCase):
+    def test_python_grid_is_capped(self):
+        from torch._inductor.runtime.triton_heuristics import CappedGrid1D
+
+        grid = CappedGrid1D(inductor_meta={"grid_cap": 66}, mode="python")
+        grid.generate({"XBLOCK": 1024})
+        self.assertEqual(grid.x_grid, "min(-((xnumel) // -(1024)), 66)")
+        # Below the cap the grid matches Grid1D; above it, 66 programs loop over the
+        # blocks
+        meta = {"XBLOCK": 1024}
+        self.assertEqual(grid.eval_slow({**meta, "xnumel": 10000}), (10, 1, 1))
+        self.assertEqual(grid.eval_slow({**meta, "xnumel": 66 * 1024}), (66, 1, 1))
+        self.assertEqual(grid.eval_slow({**meta, "xnumel": 1 << 24}), (66, 1, 1))
+        # No elements, no programs
+        self.assertEqual(grid.eval_slow({**meta, "xnumel": 0}), (0, 1, 1))
+
+    def test_cpp_grid_is_capped(self):
+        from torch._inductor.runtime.triton_heuristics import CappedGrid1D
+
+        grid = CappedGrid1D(inductor_meta={"grid_cap": 66}, mode="cpp")
+        grid.generate({"XBLOCK": 1024})
+        self.assertEqual(
+            grid.x_grid,
+            "std::min((long)(((xnumel + (1024 - 1)) / (1024))), (long)66)",
+        )
+        self.assertEqual((grid.y_grid, grid.z_grid), (1, 1))
+
+    def test_grid_cap_must_be_at_least_one(self):
+        from torch._inductor.runtime.triton_heuristics import CappedGrid1D
+
+        grid = CappedGrid1D(inductor_meta={"grid_cap": 0}, mode="python")
+        with self.assertRaisesRegex(AssertionError, "at least 1"):
+            grid.generate({"XBLOCK": 1024})
+
+    def test_from_meta_resolves_capped_grid(self):
+        from torch._inductor.runtime.triton_heuristics import CappedGrid1D, GridExpr
+
+        inductor_meta = {"grid_type": "CappedGrid1D", "grid_cap": 44}
+        grid = GridExpr.from_meta(inductor_meta, {"XBLOCK": 512})
+        self.assertIsInstance(grid, CappedGrid1D)
+        self.assertEqual(grid.eval_slow({"xnumel": 1 << 20, "XBLOCK": 512}), (44, 1, 1))
+        lazy = GridExpr.from_meta_lazy(inductor_meta, "triton_poi_fused_0")
+        self.assertIsInstance(lazy, CappedGrid1D)
+        self.assertEqual(
+            lazy.x_grid,
+            "std::min((long)(((xnumel + (triton_poi_fused_0_result.xblocks[0] - 1))"
+            " / (triton_poi_fused_0_result.xblocks[0]))), (long)44)",
+        )
+
+
+class TestCappedGridAutotuneConfigs(TestCase):
+    # With `inductor_meta["grid_cap"]` set, a one-dimensional pointwise kernel autotunes
+    # over the capped candidates instead of the stock ones, and a looped reduction gets
+    # extra candidates next to the stock ones unless one of the exclusions tested below
+    # applies. Other kernels keep the stock candidates.
+    def _pointwise(
+        self, size_hints, device=None, min_elem_per_thread=0, **inductor_meta
+    ):
+        from torch._inductor.runtime.triton_heuristics import pointwise
+
+        configs = pointwise(
+            size_hints,
+            triton_meta={
+                "device": device or TestTritonHeuristics._fake_cuda_device_properties()
+            },
+            inductor_meta=inductor_meta,
+            min_elem_per_thread=min_elem_per_thread,
+            return_configs=True,
+        )
+        return [(c.kwargs, c.num_warps, c.num_stages) for c in configs]
+
+    def _reduction(self, size_hints, device=None, **inductor_meta):
+        configs = _reduction_configs(
+            size_hints=size_hints,
+            inductor_meta={"reduction_hint": ReductionHint.INNER, **inductor_meta},
+            triton_meta={
+                "device": device or TestTritonHeuristics._fake_cuda_device_properties()
+            },
+        )
+        return [(c.kwargs, c.num_warps) for c in configs]
+
+    def test_pointwise_candidates_replace_the_stock_ones_with_grid_cap(self):
+        stock = self._pointwise({"x": 1 << 24})
+        capped = self._pointwise({"x": 1 << 24}, grid_cap=44, grid_max_xblock=65536)
+        self.assertFalse(any(config in capped for config in stock))
+        self.assertEqual(
+            capped,
+            [
+                ({"XBLOCK": 16384}, 16, 1),
+                ({"XBLOCK": 16384}, 32, 1),
+                ({"XBLOCK": 32768}, 8, 1),
+                ({"XBLOCK": 32768}, 16, 1),
+                ({"XBLOCK": 65536}, 8, 1),
+            ],
+        )
+        # With pointwise autotuning off, only the first, unless max-autotune is on
+        self.assertEqual(
+            self._pointwise(
+                {"x": 1 << 24},
+                grid_cap=44,
+                grid_max_xblock=65536,
+                autotune_pointwise=False,
+            ),
+            [({"XBLOCK": 16384}, 16, 1)],
+        )
+        for flag in ("max_autotune", "max_autotune_pointwise"):
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    len(
+                        self._pointwise(
+                            {"x": 1 << 24},
+                            grid_cap=44,
+                            grid_max_xblock=65536,
+                            autotune_pointwise=False,
+                            **{flag: True},
+                        )
+                    ),
+                    5,
+                )
+
+    def test_pointwise_candidates_fit_the_max_xblock_and_the_size_hint(self):
+        self.assertEqual(
+            self._pointwise({"x": 1 << 24}, grid_cap=44, grid_max_xblock=16384),
+            [({"XBLOCK": 16384}, 16, 1), ({"XBLOCK": 16384}, 32, 1)],
+        )
+        self.assertEqual(
+            self._pointwise({"x": 32768}, grid_cap=44, grid_max_xblock=65536),
+            [
+                ({"XBLOCK": 16384}, 16, 1),
+                ({"XBLOCK": 16384}, 32, 1),
+                ({"XBLOCK": 32768}, 8, 1),
+                ({"XBLOCK": 32768}, 16, 1),
+            ],
+        )
+        # No candidate fits: one config at the limit, with one warp per 128 elements, up to
+        # the 32 warps of a 1,024-thread block and down to one
+        for max_xblock, num_warps in ((8192, 32), (4096, 32), (1024, 8)):
+            with self.subTest(max_xblock=max_xblock):
+                self.assertEqual(
+                    self._pointwise(
+                        {"x": 1 << 24}, grid_cap=44, grid_max_xblock=max_xblock
+                    ),
+                    [({"XBLOCK": max_xblock}, num_warps, 1)],
+                )
+        self.assertEqual(
+            self._pointwise({"x": 64}, grid_cap=44), [({"XBLOCK": 64}, 1, 1)]
+        )
+        # XBLOCK is raised to give each thread min_elem_per_thread elements, past a
+        # small grid_max_xblock but not past the size hint
+        self.assertEqual(
+            self._pointwise(
+                {"x": 1 << 24}, grid_cap=44, grid_max_xblock=64, min_elem_per_thread=4
+            ),
+            [({"XBLOCK": 128}, 1, 1)],
+        )
+        self.assertEqual(
+            self._pointwise({"x": 64}, grid_cap=44, min_elem_per_thread=4),
+            [({"XBLOCK": 64}, 1, 1)],
+        )
+        # Without grid_max_xblock the limit is the stock maximum block
+        self.assertEqual(
+            self._pointwise({"x": 1 << 24}, grid_cap=44),
+            [({"XBLOCK": TRITON_MAX_BLOCK["X"]}, 32, 1)],
+        )
+
+    def test_pointwise_candidates_fit_the_threads_per_block(self):
+        # A 512-thread block holds at most 16 warps of 32 lanes: the 32-warp candidate
+        # becomes the 16-warp one
+        small = TestTritonHeuristics._fake_cuda_device_properties()._replace(
+            max_threads_per_block=512
+        )
+        self.assertEqual(
+            self._pointwise(
+                {"x": 1 << 24}, device=small, grid_cap=44, grid_max_xblock=65536
+            ),
+            [
+                ({"XBLOCK": 16384}, 16, 1),
+                ({"XBLOCK": 32768}, 8, 1),
+                ({"XBLOCK": 32768}, 16, 1),
+                ({"XBLOCK": 65536}, 8, 1),
+            ],
+        )
+
+    def test_pointwise_candidates_halve_their_warps_on_64_lane_gpus(self):
+        wave64 = TestTritonHeuristics._fake_cuda_device_properties()._replace(
+            warp_size=64, max_threads_per_block=1024
+        )
+        self.assertEqual(
+            self._pointwise(
+                {"x": 1 << 24}, device=wave64, grid_cap=44, grid_max_xblock=65536
+            ),
+            [
+                ({"XBLOCK": 16384}, 8, 1),
+                ({"XBLOCK": 16384}, 16, 1),
+                ({"XBLOCK": 32768}, 4, 1),
+                ({"XBLOCK": 32768}, 8, 1),
+                ({"XBLOCK": 65536}, 4, 1),
+            ],
+        )
+        # and so does the fallback config, within the 16 warps of a 1,024-thread block
+        for max_xblock, num_warps in ((2048, 8), (8192, 16)):
+            with self.subTest(max_xblock=max_xblock):
+                self.assertEqual(
+                    self._pointwise(
+                        {"x": 1 << 24},
+                        device=wave64,
+                        grid_cap=44,
+                        grid_max_xblock=max_xblock,
+                    ),
+                    [({"XBLOCK": max_xblock}, num_warps, 1)],
+                )
+        # a block raised for min_elem_per_thread counts 64 lanes per warp
+        self.assertEqual(
+            self._pointwise(
+                {"x": 1 << 24},
+                device=wave64,
+                grid_cap=44,
+                grid_max_xblock=64,
+                min_elem_per_thread=4,
+            ),
+            [({"XBLOCK": 256}, 1, 1)],
+        )
+
+    def test_pointwise_two_dimensional_kernels_keep_their_candidates(self):
+        self.assertEqual(
+            self._pointwise({"y": 1024, "x": 1024}, grid_cap=44, grid_max_xblock=65536),
+            self._pointwise({"y": 1024, "x": 1024}),
+        )
+
+    def _assert_no_reduction_extras(self, size_hints, **inductor_meta):
+        self.assertEqual(
+            self._reduction(size_hints, grid_cap=66, **inductor_meta),
+            self._reduction(size_hints, **inductor_meta),
+        )
+
+    def test_reduction_candidates_follow_the_stock_ones_with_grid_cap(self):
+        stock = self._reduction({"x": 128, "r0_": 32768})
+        capped = self._reduction({"x": 128, "r0_": 32768}, grid_cap=66)
+        self.assertEqual(capped[: len(stock)], stock)
+        self.assertEqual(
+            capped[len(stock) :],
+            [
+                ({"XBLOCK": 1, "R0_BLOCK": 4096}, 16),
+                ({"XBLOCK": 1, "R0_BLOCK": 8192}, 16),
+            ],
+        )
+
+    def test_reduction_candidates_halve_their_warps_on_64_lane_gpus(self):
+        wave64 = TestTritonHeuristics._fake_cuda_device_properties()._replace(
+            warp_size=64
+        )
+        stock = self._reduction({"x": 128, "r0_": 32768}, device=wave64)
+        capped = self._reduction({"x": 128, "r0_": 32768}, device=wave64, grid_cap=66)
+        self.assertEqual(capped[: len(stock)], stock)
+        self.assertEqual(
+            capped[len(stock) :],
+            [
+                ({"XBLOCK": 1, "R0_BLOCK": 4096}, 8),
+                ({"XBLOCK": 1, "R0_BLOCK": 8192}, 8),
+            ],
+        )
+
+    def test_reduction_candidates_need_a_row_hint_of_at_least_their_block(self):
+        # a row hint of 4,096 gets the 4,096 candidate only, a hint of 2,048 none
+        stock = self._reduction({"x": 128, "r0_": 4096})
+        capped = self._reduction({"x": 128, "r0_": 4096}, grid_cap=66)
+        self.assertEqual(capped[: len(stock)], stock)
+        self.assertEqual(capped[len(stock) :], [({"XBLOCK": 1, "R0_BLOCK": 4096}, 16)])
+        self._assert_no_reduction_extras({"x": 128, "r0_": 2048})
+
+    def test_reduction_candidates_skip_tiled_strided_and_two_reduction_dimensions(self):
+        for size_hints, meta in (
+            # tiled in x and y
+            ({"x": 128, "y": 8, "r0_": 32768}, {}),
+            # two reduction dimensions
+            ({"x": 128, "r0_": 256, "r1_": 128}, {}),
+            # strided rows
+            ({"x": 128, "r0_": 32768}, {"reduction_hint": ReductionHint.OUTER}),
+            ({"x": 128, "r0_": 32768}, {"reduction_hint": ReductionHint.OUTER_TINY}),
+        ):
+            with self.subTest(size_hints=size_hints, **meta):
+                self._assert_no_reduction_extras(size_hints, **meta)
+
+    def test_reduction_candidates_skip_register_intensive_kernels(self):
+        # the stock heuristic's condition: an x size hint of at least 1,024 and at least
+        # 10 loads and reductions
+        self._assert_no_reduction_extras(
+            {"x": 1024, "r0_": 32768}, num_load=8, num_reduction=2
+        )
+        for size_hints, meta in (
+            ({"x": 512, "r0_": 32768}, {"num_load": 8, "num_reduction": 2}),
+            ({"x": 1024, "r0_": 32768}, {"num_load": 8, "num_reduction": 1}),
+        ):
+            with self.subTest(size_hints=size_hints, **meta):
+                stock = self._reduction(size_hints, **meta)
+                capped = self._reduction(size_hints, grid_cap=66, **meta)
+                self.assertEqual(
+                    capped[len(stock) :],
+                    [
+                        ({"XBLOCK": 1, "R0_BLOCK": 4096}, 16),
+                        ({"XBLOCK": 1, "R0_BLOCK": 8192}, 16),
+                    ],
+                )
+
+    def test_reduction_candidates_skip_configs_filtered_for_determinism(self):
+        for flag in (
+            "deterministic",
+            "force_filter_reduction_configs",
+            "are_deterministic_algorithms_enabled",
+        ):
+            with self.subTest(flag=flag):
+                self._assert_no_reduction_extras(
+                    {"x": 128, "r0_": 32768}, **{flag: True}
+                )
+
+
 class TestGrid2DWithYZOverflowZeroYnumel(TestCase):
     """Regression test for https://github.com/pytorch/pytorch/issues/178530"""
 
