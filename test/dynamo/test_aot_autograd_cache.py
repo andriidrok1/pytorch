@@ -571,6 +571,41 @@ class AOTAutogradCacheTests(CacheKeyEquivalenceMixin, InductorTestCase):
 
     @inductor_config.patch("fx_graph_remote_cache", False)
     @inductor_config.patch("fx_graph_cache", True)
+    @functorch_config.patch({"enable_autograd_cache": True})
+    def test_compiled_graph_wrapper_bypasses_cache(self):
+        """
+        A cache hit would skip compiled_graph_wrapper, so it bypasses
+        AOTAutogradCache while set and normal hits resume once it is unset.
+        """
+        hook_calls: list[str] = []
+
+        def hook(compiled, graph_name, *, graph_role):
+            hook_calls.append(graph_role)
+            return compiled
+
+        def fn(x):
+            return x.sin() * 2
+
+        a = torch.rand(8)
+        compiled_fn = torch.compile(fn, backend="inductor")
+        self.assertEqual(fn(a), compiled_fn(a))
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_saved"], 1)
+
+        with functorch_config.patch(compiled_graph_wrapper=hook):
+            for _ in range(2):
+                self._clear_dynamo_and_codecache()
+                self.assertEqual(fn(a), compiled_fn(a))
+        self.assertEqual(hook_calls, ["inference", "inference"])
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_bypass"], 2)
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 0)
+
+        self._clear_dynamo_and_codecache()
+        self.assertEqual(fn(a), compiled_fn(a))
+        self.assertEqual(hook_calls, ["inference", "inference"])
+        self.assertEqual(counters["aot_autograd"]["autograd_cache_hit"], 1)
+
+    @inductor_config.patch("fx_graph_remote_cache", False)
+    @inductor_config.patch("fx_graph_cache", True)
     @functorch_config.patch(
         {"enable_autograd_cache": True, "strict_autograd_cache": True}
     )
