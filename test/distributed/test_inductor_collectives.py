@@ -867,6 +867,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
         not HAS_GPU, "Inductor+accelerator needs triton and recent accelerator arch"
     )
     @skip_if_lt_x_gpu(2)
+    @skipIfXpu(
+        msg="inductor cudagraphs is CUDA-only: https://github.com/intel/torch-xpu-ops/issues/5338"
+    )
     def test_allreduce_inductor_cudagraph_trees(self):
         """
         Tests whether cudagraph trees support all_reduce from nccl

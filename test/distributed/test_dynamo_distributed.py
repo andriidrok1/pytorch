@@ -1258,7 +1258,6 @@ class TestMultiProc(DynamoDistributedMultiProcTestCase):
                 )
                 self.assertTrue(same(correct_results, opt_results))
 
-    @requires_gpu_and_triton
     @skipIfTorchInductor(msg="https://github.com/pytorch/pytorch/issues/152944")
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @config.patch(enable_compiler_collectives=True)
