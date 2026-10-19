@@ -7153,6 +7153,7 @@ instantiate_device_type_tests(
 class FunctionTritonAcceleratorTests(torch._dynamo.test_case.TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
+    @unittest.skipUnless(has_triton(), "requires gpu and triton")
     @onlyAccelerator
     def test_wrap_triton_handled_during_tracing(self, device):
         import triton
@@ -7184,6 +7185,7 @@ class FunctionTritonAcceleratorTests(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(result, torch.sin(x))
 
+    @unittest.skipUnless(has_triton(), "requires gpu and triton")
     @onlyAccelerator
     def test_capture_triton_handled_during_tracing(self, device):
         import triton
