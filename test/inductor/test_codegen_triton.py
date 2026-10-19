@@ -14,7 +14,7 @@ import sympy
 import torch
 import torch._inductor.config as inductor_config
 from torch._inductor import ir
-from torch._inductor.choices import InductorChoices
+from torch._inductor.choices import GridPolicy, InductorChoices
 from torch._inductor.codegen import triton_utils
 from torch._inductor.codegen.common import ArgName, CSEVariable, SizeArg, TensorArg
 from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
@@ -41,12 +41,18 @@ from torch._inductor.codegen.wrapper import (
 )
 from torch._inductor.dtype_propagation import DtypePropagationOpsHandler, promote_types
 from torch._inductor.graph import GraphLowering
-from torch._inductor.runtime.hints import AutotuneHint, DeviceProperties
+from torch._inductor.runtime import triton_heuristics
+from torch._inductor.runtime.hints import (
+    AutotuneHint,
+    DeviceProperties,
+    TRITON_MAX_BLOCK,
+)
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import (
     get_importable_constexpr_types,
     is_triton_fp8_dtype_supported,
     run_and_get_code,
+    run_and_get_cpp_code,
     run_and_get_kernels,
 )
 from torch._inductor.virtualized import ops, V
@@ -666,6 +672,419 @@ def helper(x):
 
         self.assertFalse(kernel.persistent_reduction)
         self.assertEqual(seen_scores, [tiling_scores])
+
+    def _capped_choices(self, policy, seen=None):
+        class CappedChoices(InductorChoices):
+            def triton_grid_policy(self, features):
+                if seen is not None:
+                    seen.append(features)
+                return policy
+
+        return CappedChoices()
+
+    def test_grid_policy_default_keeps_one_program_per_block(self):
+        xnumel = sympy.Integer(1 << 24)
+        kernel = TritonKernel({"x": xnumel}, features=SIMDKernelFeatures([], xnumel))
+        self.assertIsNone(kernel.grid_policy)
+        self.assertIn("xoffset = tl.program_id(0) * XBLOCK", kernel.body.getvalue())
+        self.assertNotIn("x_block", kernel.body.getvalue())
+        self.assertIs(kernel._get_grid_type(), triton_heuristics.Grid1D)
+        self.assertNotIn("grid_cap", kernel.inductor_meta_per_kernel())
+        self.assertEqual(kernel.max_block("x"), TRITON_MAX_BLOCK["X"])
+
+    def test_grid_policy_loops_over_x_blocks(self):
+        seen = []
+        tiling_scores = {"x": sympy.Integer(2)}
+        xnumel = sympy.Integer(1 << 24)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536), seen)):
+            kernel = TritonKernel(
+                {"x": xnumel},
+                features=SIMDKernelFeatures([], xnumel),
+                tiling_scores=tiling_scores,
+            )
+        self.assertEqual(kernel.grid_policy, GridPolicy(44, 65536))
+        self.assertEqual([f.tiling_scores for f in seen], [tiling_scores])
+        self.assertEqual(
+            kernel.body.getvalue().splitlines(),
+            [
+                "for x_block in tl.range(tl.program_id(0), (xnumel - 1) // XBLOCK + 1, "
+                "tl.num_programs(0)):",
+                "    xoffset = x_block * XBLOCK",
+                "    xindex = xoffset + tl.arange(0, XBLOCK)[:]",
+                # 2**24 is a multiple of the largest block, 65,536
+                "    xmask = tl.full([XBLOCK], True, tl.int1)[:]",
+            ],
+        )
+        self.assertIs(kernel._get_grid_type(), triton_heuristics.CappedGrid1D)
+        meta = kernel.inductor_meta_per_kernel()
+        self.assertEqual((meta["grid_cap"], meta["grid_max_xblock"]), (44, 65536))
+        self.assertEqual(kernel.max_block("x"), 65536)
+
+    def test_grid_policy_keeps_the_mask_unless_the_largest_block_divides_xnumel(self):
+        xnumel = sympy.Integer((1 << 24) + TRITON_MAX_BLOCK["X"])
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536))):
+            kernel = TritonKernel(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        self.assertIn("    xmask = xindex < xnumel", kernel.body.getvalue())
+        # Without max_xblock the stock maximum block sets the mask and the candidates
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44))):
+            kernel = TritonKernel(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        self.assertIn(
+            "    xmask = tl.full([XBLOCK], True, tl.int1)", kernel.body.getvalue()
+        )
+        self.assertNotIn("grid_max_xblock", kernel.inductor_meta_per_kernel())
+
+    def test_grid_policy_mask_assumes_at_least_the_stock_max_block(self):
+        # Coordinate descent can raise XBLOCK up to TRITON_MAX_BLOCK["X"], so a smaller
+        # max_xblock does not drop the mask
+        xnumel = sympy.Integer(3 * 1024)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 1024))):
+            kernel = TritonKernel(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        self.assertIn("    xmask = xindex < xnumel", kernel.body.getvalue())
+        self.assertEqual(kernel.max_block("x"), TRITON_MAX_BLOCK["X"])
+
+    def test_grid_policy_int64_sizes(self):
+        xnumel = sympy.Integer(1 << 31)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536))):
+            kernel = TritonKernel(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        self.assertEqual(kernel.index_dtype, "tl.int64")
+        code = kernel.body.getvalue()
+        self.assertIn(
+            "for x_block in tl.range(tl.program_id(0), "
+            "(xnumel.to(tl.int64) - 1) // XBLOCK + 1, tl.num_programs(0)):",
+            code,
+        )
+        self.assertIn("    xoffset = x_block.to(tl.int64) * XBLOCK", code)
+
+    def test_grid_policy_counter_is_int64_near_the_int32_limit(self):
+        # With XBLOCK 1 the counter steps past the last block by up to the 44
+        # programs, so the bound stays int32 while xnumel + 44 fits int32 and is int64
+        # from the next xnumel on, where x_block is converted to the int32 index dtype
+        # before xoffset is computed
+        int32_bound = "(xnumel - 1) // XBLOCK + 1"
+        int64_bound = "(xnumel.to(tl.int64) - 1) // XBLOCK + 1"
+        for size, bound, pid in (
+            (2**31 - 1 - 44, int32_bound, "x_block"),
+            (2**31 - 44, int64_bound, "x_block.to(tl.int32)"),
+            (2**31 - 10, int64_bound, "x_block.to(tl.int32)"),
+        ):
+            with self.subTest(xnumel=size):
+                xnumel = sympy.Integer(size)
+                with V.set_choices_handler(self._capped_choices(GridPolicy(44, 1))):
+                    kernel = TritonKernel(
+                        {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+                    )
+                self.assertEqual(kernel.index_dtype, "tl.int32")
+                code = kernel.body.getvalue()
+                self.assertIn(
+                    f"for x_block in tl.range(tl.program_id(0), {bound}, "
+                    "tl.num_programs(0)):",
+                    code,
+                )
+                self.assertIn(f"    xoffset = {pid} * XBLOCK", code)
+
+    def test_grid_policy_looped_reduction_constants_outside_the_loop(self):
+        xnumel, rnumel = sympy.Integer(1024), sympy.Integer(65536)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(66))):
+            kernel = TritonKernel(
+                {"x": xnumel, "r0_": rnumel},
+                features=SIMDKernelFeatures([], xnumel, rnumel),
+                override_persistent_reduction=False,
+                override_cooperative_reduction=False,
+            )
+        self.assertFalse(kernel.persistent_reduction)
+        lines = kernel.body.getvalue().splitlines()
+        header = next(
+            i for i, line in enumerate(lines) if line.startswith("for x_block")
+        )
+        # The reduction constants stay outside the loop and the reduction indexing is
+        # inside it
+        self.assertTrue(all(not line.startswith(" ") for line in lines[:header]))
+        self.assertTrue(any("R0_BLOCK" in line for line in lines[:header]))
+        self.assertTrue(all(line.startswith("    ") for line in lines[header + 1 :]))
+        self.assertTrue(
+            any(line.lstrip().startswith("r0_base = ") for line in lines[header + 1 :])
+        )
+        self.assertIs(kernel._get_grid_type(), triton_heuristics.CappedGrid1D)
+
+    def test_grid_policy_every_reduction_pass_runs_inside_the_x_loop(self):
+        xnumel, rnumel = sympy.Integer(1024), sympy.Integer(65536)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(66))):
+            kernel = TritonKernel(
+                {"x": xnumel, "r0_": rnumel},
+                features=SIMDKernelFeatures([], xnumel, rnumel),
+                override_persistent_reduction=False,
+                override_cooperative_reduction=False,
+            )
+        # Two passes over the row, flushed the way a looped reduction flushes them when
+        # its second pass reads the first pass's statistics
+        with kernel:
+            kernel.compute.writeline("tmp0 = 1.0")
+            kernel.codegen_body()
+            kernel.compute.writeline("tmp1 = 2.0")
+            kernel.codegen_body()
+        lines = kernel.body.getvalue().splitlines()
+        header = next(
+            i for i, line in enumerate(lines) if line.startswith("for x_block")
+        )
+        passes = [
+            i for i, line in enumerate(lines) if "for r0_offset in tl.range(" in line
+        ]
+        self.assertEqual(len(passes), 2)
+        for i in passes:
+            self.assertGreater(i, header)
+            self.assertTrue(lines[i].startswith("    for r0_offset"))
+
+    def test_grid_policy_hook_not_asked_for_excluded_kernels(self):
+        self._stack.enter_context(self._graph.set_current_device(torch.device("cpu")))
+        xnumel, rnumel = sympy.Integer(1024), sympy.Integer(512)
+
+        def pointwise(cls=TritonKernel, **kwargs):
+            return cls({"x": xnumel}, features=SIMDKernelFeatures([], xnumel), **kwargs)
+
+        def reduction(persistent, cooperative=False, **kwargs):
+            return TritonKernel(
+                {"x": xnumel, "r0_": rnumel},
+                features=SIMDKernelFeatures([], xnumel, rnumel),
+                override_persistent_reduction=persistent,
+                override_cooperative_reduction=cooperative,
+                **kwargs,
+            )
+
+        def without_x_dim():
+            return reduction(
+                True, fixed_config=FixedTritonConfig({"XBLOCK": 1, "R0_BLOCK": 512})
+            )
+
+        def two_reduction_dims():
+            return TritonKernel(
+                {"x": xnumel, "r0_": rnumel, "r1_": rnumel},
+                features=SIMDKernelFeatures([], xnumel, rnumel * rnumel),
+                override_persistent_reduction=False,
+                override_cooperative_reduction=False,
+            )
+
+        def two_dimensional():
+            return TritonKernel(
+                {"y": sympy.Integer(64), "x": xnumel},
+                features=SIMDKernelFeatures([], xnumel * 64),
+            )
+
+        def nested_or_staged():
+            return TritonKernel(
+                {"x": xnumel},
+                features=SIMDKernelFeatures([], xnumel, indexing_node_schedule=[]),
+            )
+
+        class OwnCodegenKernel(TritonKernel):
+            pass
+
+        class OptedIn(TritonKernel):
+            supports_grid_policy = True
+
+        def native_matmul():
+            # An opted-in kernel whose is_native_matmul is True, as when its schedule
+            # holds a native matmul
+            with patch.object(
+                OptedIn,
+                "is_native_matmul",
+                property(lambda self: True, lambda self, value: None),
+                create=True,
+            ):
+                kernel = pointwise(OptedIn)
+                self.assertTrue(kernel.is_native_matmul)
+            return kernel
+
+        def under(changes, make):
+            def make_under_changes():
+                with inductor_config.patch(changes):
+                    return make()
+
+            return make_under_changes
+
+        cases = [
+            ("persistent reduction", lambda: reduction(True)),
+            ("mix-order reduction", lambda: reduction(True, mix_order_reduction=True)),
+            ("kernel without an x dimension", without_x_dim),
+            ("cooperative reduction", lambda: reduction(False, cooperative=True)),
+            ("two reduction dimensions", two_reduction_dims),
+            ("two-dimensional pointwise kernel", two_dimensional),
+            ("nested or staged reduction", nested_or_staged),
+            ("native matmul", native_matmul),
+            ("combo kernel", lambda: pointwise(is_combo_kernel=True)),
+            (
+                "fixed config",
+                lambda: pointwise(fixed_config=FixedTritonConfig({"XBLOCK": 128})),
+            ),
+            ("hint override", lambda: pointwise(hint_override=1024)),
+            (
+                "one x element",
+                lambda: TritonKernel(
+                    {"x": sympy.Integer(1)},
+                    features=SIMDKernelFeatures([], sympy.Integer(1)),
+                ),
+            ),
+            ("subclass", lambda: pointwise(OwnCodegenKernel)),
+            ("block pointers", under({"triton.use_block_ptr": True}, pointwise)),
+            (
+                "tensor descriptors",
+                under({"triton.use_tensor_descriptor": True}, pointwise),
+            ),
+            ("multi-kernel", under({"triton.multi_kernel": 1}, pointwise)),
+            ("FX IR wrapper", under({"fx_wrapper": True}, pointwise)),
+            (
+                "compile-time combo autotuning",
+                under(
+                    {"combo_kernels": True, "combo_kernel_compile_time_autotune": True},
+                    pointwise,
+                ),
+            ),
+        ]
+        for label, make in cases:
+            with self.subTest(label):
+                seen = []
+                with V.set_choices_handler(self._capped_choices(GridPolicy(44), seen)):
+                    kernel = make()
+                self.assertEqual(seen, [])
+                self.assertIsNone(kernel.grid_policy)
+        # Without an excluding condition, the same factories are asked
+        seen = []
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44), seen)):
+            self.assertEqual(pointwise().grid_policy, GridPolicy(44))
+            self.assertEqual(reduction(False).grid_policy, GridPolicy(44))
+            self.assertEqual(pointwise(OptedIn).grid_policy, GridPolicy(44))
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(without_x_dim().no_x_dim)
+        self.assertFalse(OwnCodegenKernel.supports_grid_policy)
+
+    def test_grid_policy_subclass_opts_in(self):
+        class OptedIn(TritonKernel):
+            supports_grid_policy = True
+
+        class Grandchild(OptedIn):
+            pass
+
+        seen = []
+        xnumel = sympy.Integer(1 << 24)
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536), seen)):
+            opted_in = OptedIn({"x": xnumel}, features=SIMDKernelFeatures([], xnumel))
+            grandchild = Grandchild(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        self.assertEqual(opted_in.grid_policy, GridPolicy(44, 65536))
+        self.assertIsNone(grandchild.grid_policy)
+        self.assertEqual(len(seen), 1)
+
+    def test_grid_policy_turns_off_pdl(self):
+        xnumel = sympy.Integer(1 << 24)
+        stock = TritonKernel({"x": xnumel}, features=SIMDKernelFeatures([], xnumel))
+        with V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536))):
+            capped = TritonKernel(
+                {"x": xnumel}, features=SIMDKernelFeatures([], xnumel)
+            )
+        # With PDL enabled and a CUDA device of compute capability 9, the stock kernel
+        # launches with PDL and the capped kernel does not
+        with (
+            inductor_config.patch({"triton.enable_pdl": True}),
+            self._graph.set_current_device(torch.device("cuda")),
+            patch.object(torch.version, "hip", None),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            with stock:
+                self.assertTrue(TritonKernel._enable_pdl_codegen())
+            with capped:
+                self.assertFalse(TritonKernel._enable_pdl_codegen())
+
+    def test_grid_policy_validates_its_fields(self):
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            GridPolicy(0)
+        self.assertEqual(GridPolicy(1).programs, 1)
+        for max_xblock in (0, 3000):
+            with self.assertRaisesRegex(ValueError, "power of 2"):
+                GridPolicy(44, max_xblock)
+        self.assertIsNone(GridPolicy(44).max_xblock)
+
+    def _compile_capped(self, fn, *args, policy=None, **compile_kwargs):
+        policy = policy or GridPolicy(44, 65536)
+        with V.set_choices_handler(self._capped_choices(policy)):
+            compiled = torch.compile(fn, **compile_kwargs)
+            result, code = run_and_get_code(compiled, *args)
+        return compiled, result, "\n".join(code)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_grid_policy_capped_pointwise_kernel_matches_eager(self):
+        def cast(x):
+            return x.to(torch.float16) * 2.0
+
+        x = torch.randn((1 << 24) + 3, device=GPU_TYPE).to(torch.bfloat16)
+        _, actual, code = self._compile_capped(cast, x, fullgraph=True)
+        self.assertIn("for x_block in tl.range(tl.program_id(0), ", code)
+        self.assertIn("'grid_type': 'CappedGrid1D'", code)
+        self.assertIn("'grid_cap': 44", code)
+        self.assertEqual(actual, cast(x), atol=0, rtol=0)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_grid_policy_capped_looped_reductions_match_eager(self):
+        def row_max(x):
+            return torch.amax(x.float(), dim=1)
+
+        def layer_norm(x):
+            return torch.nn.functional.layer_norm(x, x.shape[-1:])
+
+        x = torch.randn(256, 65536, device=GPU_TYPE, dtype=torch.float16)
+        policy = GridPolicy(66)
+        _, actual, code = self._compile_capped(row_max, x, policy=policy)
+        self.assertIn("@triton_heuristics.reduction(", code)
+        self.assertIn("for x_block in tl.range(tl.program_id(0), ", code)
+        self.assertEqual(actual, row_max(x), atol=0, rtol=0)
+        # One kernel holds the statistics pass and the normalizing pass. Its body is
+        # indented once and its x loop's body twice, so both passes are in the x loop.
+        with inductor_config.patch({"split_reductions": False}):
+            _, actual, code = self._compile_capped(layer_norm, x, policy=policy)
+        self.assertIn("for x_block in tl.range(tl.program_id(0), ", code)
+        self.assertEqual(code.count("@triton.jit"), 1)
+        self.assertGreaterEqual(code.count("\n        for r0_offset in tl.range("), 2)
+        self.assertEqual(actual, layer_norm(x), atol=1e-2, rtol=1e-2)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_grid_policy_dynamic_size_below_its_hint(self):
+        def cast(x):
+            return x.to(torch.float16) * 2.0
+
+        x = torch.randn(1 << 22, device=GPU_TYPE).to(torch.bfloat16)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled, actual, code = self._compile_capped(cast, x)
+        self.assertIn("for x_block in tl.range(tl.program_id(0), ", code)
+        self.assertEqual(actual, cast(x), atol=0, rtol=0)
+        # The same kernel, without a recompile, for fewer blocks than the 44-program
+        # cap and for an uneven size
+        with torch._dynamo.config.patch(error_on_recompile=True):
+            for numel in (5000, (1 << 20) + 3):
+                y = x[:numel]
+                self.assertEqual(compiled(y), cast(y), atol=0, rtol=0)
+
+    @unittest.skipUnless(HAS_GPU_AND_TRITON, "requires GPU and Triton")
+    def test_grid_policy_cpp_wrapper_caps_the_grid(self):
+        def cast(x):
+            return x.to(torch.float16) * 2.0
+
+        x = torch.randn((1 << 24) + 3, device=GPU_TYPE).to(torch.bfloat16)
+        with (
+            inductor_config.patch({"cpp_wrapper": True}),
+            V.set_choices_handler(self._capped_choices(GridPolicy(44, 65536))),
+        ):
+            actual, code = run_and_get_cpp_code(torch.compile(cast, fullgraph=True), x)
+        # GridExpr.minimum renders the cap as the last operand of std::min
+        self.assertIn("std::min(", code)
+        self.assertIn("(long)44)", code)
+        self.assertEqual(actual, cast(x), atol=0, rtol=0)
 
     @parametrize(
         "reduction_type,identity,reduction_fn",
