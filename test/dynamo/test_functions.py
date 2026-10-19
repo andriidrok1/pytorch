@@ -42,7 +42,6 @@ from torch._dynamo.variables.lists import RangeVariable
 from torch.nn import functional as F
 from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
-    onlyAccelerator,
 )
 from torch.testing._internal.common_utils import (
     HardwareClassification,
@@ -4039,7 +4038,7 @@ partial_fn = functools.partial(fn, scale=2)
     def test_filter(self):
         def fn(inputs):
             out = inputs[0]
-            for inp in filter(lambda x: x.requires_grad, inputs):
+            for inp in filter(lambda x: (x.requires_grad), inputs):
                 out = out * inp
             return out
 
@@ -7027,13 +7026,9 @@ class FunctionTestsCudaOnly(torch._dynamo.test_case.TestCase):
         )
 
 
-instantiate_device_type_tests(FunctionTestsCudaOnly, globals(), only_for="cuda")
-
-
 class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
     hw_classification = HardwareClassification.ACCELERATOR
 
-    @onlyAccelerator
     def test_torch_get_device_module(self, device):
         def f1():
             mod1 = torch.get_device_module()
@@ -7098,7 +7093,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
 
         f6()
 
-    @onlyAccelerator
     def test_device_manual_seed(self, device):
         import torch._inductor.config as inductor_config
 
@@ -7123,7 +7117,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
                     self.assertEqual(foo(), foo())
                     self.assertEqual(foo(), foo())
 
-    @onlyAccelerator
     def test_tensor_type2(self, device):
         def fn(a, b):
             m = a.to(device)
@@ -7133,7 +7126,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
             self, fn=fn, nargs=2, expected_frame_count=1
         )
 
-    @onlyAccelerator
     def test_tensor_type5(self, device):
         def fn(a, b):
             m = a.to(device).half()
@@ -7144,7 +7136,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
         )
 
     @xfailIfNoAcceleratorTriton
-    @onlyAccelerator
     def test_wrap_triton_handled_during_tracing(self, device):
         import triton
         import triton.language as tl
@@ -7176,7 +7167,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
         self.assertEqual(result, torch.sin(x))
 
     @xfailIfNoAcceleratorTriton
-    @onlyAccelerator
     def test_capture_triton_handled_during_tracing(self, device):
         import triton
         import triton.language as tl
@@ -7206,9 +7196,6 @@ class FunctionTestsDevice(torch._dynamo.test_case.TestCase):
         result = compiled(x)
 
         self.assertEqual(result, torch.sin(x))
-
-
-instantiate_device_type_tests(FunctionTestsDevice, globals(), allow_xpu=True)
 
 
 def udf_mul(x, y):
@@ -8703,6 +8690,11 @@ class DefaultsTests(torch._dynamo.test_case.TestCase):
 
         self.assertEqual(result, expected)
 
+
+instantiate_device_type_tests(FunctionTestsCudaOnly, globals(), only_for="cuda")
+instantiate_device_type_tests(
+    FunctionTestsDevice, globals(), except_for="cpu", allow_xpu=True
+)
 
 instantiate_parametrized_tests(FunctionTests)
 instantiate_parametrized_tests(DefaultsTests)
