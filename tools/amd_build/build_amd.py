@@ -179,6 +179,7 @@ hip_platform_files = [
     "third_party/kineto/libkineto/CMakeLists.txt",
     "third_party/nvfuser/CMakeLists.txt",
     "third_party/tensorpipe/cmake/Hip.cmake",
+    "torch/csrc/profiler/kineto/libkineto/CMakeLists.txt",
 ]
 
 
