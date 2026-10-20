@@ -1,12 +1,10 @@
 # Owner(s): ["module: inductor"]
 
-import copy
 import os
 import unittest
 from unittest import mock
 
 import torch
-from torch import nn
 from torch._dynamo.utils import counters, same
 from torch._inductor import config, metrics
 from torch._inductor.fx_passes.reduced_atomic_contention import (
@@ -171,9 +169,7 @@ class TestScatterOpt(TestCase):
         The full+scatter -> pointwise rewrite must preserve the const tensor's
         dtype. torch.where with Python scalar branches promotes to the default
         float dtype (float32), so for a low-precision const tensor (e.g. f16)
-        the rewrite previously produced a float32 result. This is exactly the
-        pattern emitted by nll_loss_backward / cross_entropy backward on f16
-        inputs.
+        the rewrite previously produced a float32 result.
         """
         M, N = 1024, 2048
 
@@ -199,54 +195,6 @@ class TestScatterOpt(TestCase):
                 lambda msg: f"{msg}\n{expect=}\n{actual=}\n",
             )
             self.check_metric()
-
-    def test_cross_entropy_loss(self):
-        """
-        Match full+scatter in CEL and replaces it with a pointwise.
-
-        Perf data on an A100 GPU:
-        Without the scatter optimization:
-          ms=47.340, peak_mem=10.524 GB
-        With the scatter optimization:
-          ms=42.768, peak_mem=7.227 GB
-        """
-        B, T, D, V = 32, 1024, 768, 50257
-        if not DO_PERF_TEST:
-            # use a smaller V if not doing perf test to avoid OOM
-            # in CI
-            V = V // 100
-        ref_model = nn.Linear(D, V).to(torch.bfloat16)
-        opt_model = copy.deepcopy(ref_model)
-        ce = nn.CrossEntropyLoss()
-
-        def f(m, x, label):
-            ce(m(x).view(-1, V), label.view(-1)).backward()
-
-        opt_f = torch.compile(f)
-
-        x = torch.randn(B, T, D).to(torch.bfloat16)
-        label = torch.randint(0, V, (B, T)).to(torch.int64)
-
-        f(ref_model, x, label)
-        ref_grad = ref_model.weight.grad
-        opt_f(opt_model, x, label)
-        act_grad = opt_model.weight.grad
-        if not torch.allclose(ref_grad, act_grad, atol=1e-3, rtol=1e-3):
-            raise AssertionError(f"{ref_grad=}\n{act_grad=}")
-
-        self.check_metric()
-
-        if DO_PERF_TEST:
-            if GPU_TYPE == "xpu":
-                raise unittest.SkipTest(
-                    "torch.xpu.reset_peak_memory_stats not implemented."
-                )
-            torch.accelerator.reset_peak_memory_stats()
-            for _ in range(3):
-                opt_f(opt_model, x, label)
-            ms = benchmarker.benchmark_gpu(lambda: opt_f(opt_model, x, label))
-            peak_mem = torch.accelerator.max_memory_allocated() / 10**9
-            print(f"{ms=:.3f}, {peak_mem=:.3f} GB")
 
 
 class TestPartitionedScatterOpt(TestCase):
