@@ -145,7 +145,7 @@ def _should_enable_triton_debug_asserts(inductor_meta: InductorMeta) -> bool:
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Container, Generator, Hashable
+    from collections.abc import Callable, Container, Generator, Hashable, Mapping
 
     from torch._C._profiler import _RecordFunctionFast
     from torch._guards import CompileId
@@ -4702,6 +4702,78 @@ def _maybe_filter_configs_for_tma_restrictions(
     return configs
 
 
+def validate_grid_cap(grid_cap: Any) -> int:
+    """`grid_cap`, the maximum number of programs a capped grid launches. It must be an
+    int of at least 1. The autotuning candidates and CappedGrid1D both check it here."""
+    if grid_cap is None:
+        raise AssertionError("grid_type CappedGrid1D needs a grid_cap")
+    if isinstance(grid_cap, bool) or not isinstance(grid_cap, int) or grid_cap < 1:
+        raise AssertionError(f"grid_cap must be an int of at least 1, got {grid_cap!r}")
+    return grid_cap
+
+
+def capped_grid_cap(inductor_meta: Mapping[str, Any]) -> int | None:
+    """The program cap of a kernel that launches on CappedGrid1D, None for every other
+    kernel. The grid type decides, as it does for the launch grid, so the autotuning
+    candidates always match the grid: grid_type CappedGrid1D needs a grid_cap of at
+    least 1, and a grid_cap with any other grid type is an error."""
+    grid_cap = inductor_meta.get("grid_cap")
+    grid_type = inductor_meta.get("grid_type")
+    if grid_type != CappedGrid1D.__name__:
+        if grid_cap is not None:
+            raise AssertionError(
+                f"grid_cap={grid_cap} needs grid_type CappedGrid1D, got {grid_type}"
+            )
+        return None
+    return validate_grid_cap(grid_cap)
+
+
+def capped_grid_max_xblock(inductor_meta: Mapping[str, Any]) -> int:
+    """`grid_max_xblock`, the limit on a capped pointwise kernel's candidate XBLOCKs
+    (default TRITON_MAX_BLOCK["X"]). It must be an int power of 2."""
+    max_xblock = inductor_meta.get("grid_max_xblock", TRITON_MAX_BLOCK["X"])
+    if (
+        isinstance(max_xblock, bool)
+        or not isinstance(max_xblock, int)
+        or max_xblock < 1
+        or max_xblock & (max_xblock - 1)
+    ):
+        raise AssertionError(
+            f"grid_max_xblock must be an int power of 2, got {max_xblock!r}"
+        )
+    return max_xblock
+
+
+def capped_grid_pointwise_config(xblock: int, num_warps: int) -> Config:
+    """The Config of one capped pointwise candidate, with one pipeline stage."""
+    return Config({"XBLOCK": xblock}, num_warps=num_warps, num_stages=1)
+
+
+def check_capped_grid_size_hints(size_hints: Mapping[str, int]) -> None:
+    """CappedGrid1D launches programs along x only, so a capped kernel has no y or z
+    dimension."""
+    if "y" in size_hints or "z" in size_hints:
+        raise AssertionError(
+            "grid_type CappedGrid1D launches programs along x only, got size_hints "
+            f"{dict(size_hints)}"
+        )
+
+
+def check_capped_grid_config(cfg: Config, inductor_meta: Mapping[str, Any]) -> None:
+    """check_config's divisibility rule, for a config of a capped kernel: its XBLOCK
+    divides the larger of grid_max_xblock and TRITON_MAX_BLOCK["X"]. A capped kernel's
+    codegen must take that block as its largest XBLOCK (TritonKernel.max_block("x")),
+    and may drop the x mask only when xnumel is a multiple of the block, so that the
+    kernel has no partial block."""
+    mask_block = max(capped_grid_max_xblock(inductor_meta), TRITON_MAX_BLOCK["X"])
+    xblock = cfg.kwargs["XBLOCK"]
+    if mask_block % xblock != 0:
+        raise AssertionError(
+            "a capped kernel's XBLOCK must divide max(grid_max_xblock, "
+            f'TRITON_MAX_BLOCK["X"]) = {mask_block}, but XBLOCK={xblock} (cfg={cfg})'
+        )
+
+
 def pointwise(
     size_hints,
     triton_meta: TritonMeta,
@@ -4755,14 +4827,31 @@ def pointwise(
     from torch._inductor.heuristics.registry import get_codegen_heuristic
 
     pointwise_heuristic = get_codegen_heuristic("pointwise", triton_meta["device"].type)
-    configs = pointwise_heuristic.get_configs(
-        size_hints,
-        bs,
-        triton_config_with_settings,
-        hinted_configs,
-        tile_hint=tile_hint,
-        inductor_meta=inductor_meta,
-    )
+    # A kernel on a capped grid autotunes over its own candidates: with the default CUDA
+    # blocks (at most 1,024 elements), each program's loop keeps too few loads in
+    # flight. The capped-grid meta is checked here, before the device's hook runs, and
+    # the hook is asked only for a capped kernel
+    configs = []
+    if capped_grid_cap(inductor_meta) is not None:
+        check_capped_grid_size_hints(size_hints)
+        capped_grid_max_xblock(inductor_meta)
+        configs = pointwise_heuristic.get_capped_grid_configs(
+            size_hints=size_hints,
+            inductor_meta=inductor_meta,
+            triton_meta=triton_meta,
+            min_elem_per_thread=min_elem_per_thread,
+        )
+        for capped_config in configs:
+            check_capped_grid_config(capped_config, inductor_meta)
+    if not configs:
+        configs = pointwise_heuristic.get_configs(
+            size_hints,
+            bs,
+            triton_config_with_settings,
+            hinted_configs,
+            tile_hint=tile_hint,
+            inductor_meta=inductor_meta,
+        )
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
     if return_configs:
@@ -4851,6 +4940,18 @@ def _reduction_configs(
         triton_meta=triton_meta,
         num_dynamic=num_dynamic,
     )
+    # The capped-grid meta is checked here, before the device's hook runs, the hook is
+    # asked only for a capped kernel, and its configs are checked like the pointwise
+    # ones
+    if capped_grid_cap(inductor_meta) is not None:
+        check_capped_grid_size_hints(size_hints)
+        capped_grid_max_xblock(inductor_meta)
+        if capped := reduction_heuristic.get_capped_grid_configs(
+            size_hints=size_hints, inductor_meta=inductor_meta, triton_meta=triton_meta
+        ):
+            for capped_config in capped:
+                check_capped_grid_config(capped_config, inductor_meta)
+            configs = unique_configs([*configs, *capped])
     r0 = inductor_meta.get("strict_reduction_rblock")
     if r0 is not None:
         configs = copy.deepcopy(configs)
@@ -4859,6 +4960,19 @@ def _reduction_configs(
                 triton_config.kwargs["R0_BLOCK"] = r0
         configs = unique_configs(configs)
     return configs
+
+
+def should_filter_reduction_configs_for_determinism(
+    inductor_meta: Mapping[str, Any],
+) -> bool:
+    """Whether filter_reduction_configs_for_determinism keeps a single reduction
+    config, picked without a benchmark: in deterministic mode, with
+    force_filter_reduction_configs or with deterministic algorithms enabled."""
+    return bool(
+        inductor_meta.get("deterministic", False)
+        or inductor_meta.get("force_filter_reduction_configs", False)
+        or inductor_meta.get("are_deterministic_algorithms_enabled")
+    )
 
 
 def filter_reduction_configs_for_determinism(
@@ -4878,13 +4992,10 @@ def filter_reduction_configs_for_determinism(
     if len(configs) == 0:
         raise AssertionError("No configs remaining after deduplication")
 
-    def _do_filter_due_to_inductor_config():
-        return (
-            inductor_meta.get("deterministic", False)
-            or inductor_meta.get("force_filter_reduction_configs", False)
-        ) or inductor_meta.get("are_deterministic_algorithms_enabled")
-
-    if not _do_filter_due_to_inductor_config() or len(configs) == 1:
+    if (
+        not should_filter_reduction_configs_for_determinism(inductor_meta)
+        or len(configs) == 1
+    ):
         # no filtering happening if NOT in deterministic mode
         return configs
 
@@ -5407,6 +5518,19 @@ class GridExpr:
         cpp_items = [f"(long){x}" if isinstance(x, int) else str(x) for x in items]
         return functools.reduce(lambda x, y: f"std::max({x}, {y})", cpp_items)
 
+    def minimum(self, seq: list[int | str]) -> int | str:
+        """Codegen for min with constant folding; constants are represented as int"""
+        items = self._constant_fold(min, seq)
+        if len(items) <= 1:
+            return items[0]
+        if self.mode == "python":
+            return f"min({', '.join(map(str, items))})"
+        # std::min deduces one type: cast every item, constants and expressions, to long
+        cpp_items = [
+            f"(long){x}" if isinstance(x, int) else f"(long)({x})" for x in items
+        ]
+        return functools.reduce(lambda x, y: f"std::min({x}, {y})", cpp_items)
+
     def summation(self, seq: list[int | str]) -> int | str:
         """Codegen for sum function with constant folding, constants are represented as int"""
         items = self._constant_fold(sum, seq)
@@ -5501,6 +5625,15 @@ class GridExpr:
 class Grid1D(GridExpr):
     def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
         self.x_grid = self.ceildiv("xnumel", meta.get("XBLOCK"))
+
+
+class CappedGrid1D(GridExpr):
+    """Grid1D capped at `inductor_meta["grid_cap"]` programs, for a kernel whose
+    programs loop over its x blocks."""
+
+    def generate(self, meta: dict[str, int], is_lazy: bool = False) -> None:
+        cap = validate_grid_cap(self.inductor_meta.get("grid_cap"))
+        self.x_grid = self.minimum([self.ceildiv("xnumel", meta.get("XBLOCK")), cap])
 
 
 class Grid2D(GridExpr):

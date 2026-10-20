@@ -209,22 +209,20 @@ class ReductionHeuristic(CodegenConfigHeuristics):
             "max_autotune_pointwise"
         )
 
-        register_intensive = False
+        register_intensive = self._register_intensive(size_hints, inductor_meta)
         loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
             "num_reduction", 0
         )
 
-        device_major = triton_meta["device"].major
         warp_size = triton_meta["device"].warp_size_or_default
         # Kernels with per-row accumulators have room for larger reduction
         # blocks than the contiguous default.
         scalar_accumulators = AutotuneHint.SCALAR_ACCUMULATORS in inductor_meta.get(
             "autotune_hints", ()
         )
-        MAX_R0_BLOCK = 1024 if device_major is not None and device_major >= 10 else 2048
-        if size_hints["x"] >= 1024 and loads_and_red >= 10:
-            MAX_R0_BLOCK = 1024
-            register_intensive = True
+        MAX_R0_BLOCK = self._default_max_r0_block(
+            size_hints, inductor_meta, triton_meta
+        )
 
         if triton_meta.get("native_matmul"):
             if len(size_hints) == 3:
@@ -382,6 +380,84 @@ class ReductionHeuristic(CodegenConfigHeuristics):
         return self._finalize_configs(
             result_configs, make_config, size_hints, inductor_meta
         )
+
+    def _register_intensive(
+        self, size_hints: dict[str, int], inductor_meta: dict[str, Any]
+    ) -> bool:
+        """Whether a reduction is register-intensive: an x size hint of at least 1,024
+        and at least 10 loads and reductions. get_configs then lowers its R0_BLOCK limit
+        to 1,024 and builds register-intensive configs, and get_capped_grid_configs adds
+        no candidates."""
+        loads_and_red = inductor_meta.get("num_load", 0) + inductor_meta.get(
+            "num_reduction", 0
+        )
+        return size_hints["x"] >= 1024 and loads_and_red >= 10
+
+    def _default_max_r0_block(
+        self,
+        size_hints: dict[str, int],
+        inductor_meta: dict[str, Any],
+        triton_meta: dict[str, Any],
+    ) -> int:
+        """get_configs' default R0_BLOCK limit: 1,024 on GPUs of compute capability 10
+        or above and for register-intensive reductions, otherwise 2,048."""
+        device_major = triton_meta["device"].major
+        if device_major is not None and device_major >= 10:
+            return 1024
+        return 1024 if self._register_intensive(size_hints, inductor_meta) else 2048
+
+    def get_capped_grid_configs(
+        self,
+        *,
+        size_hints: dict[str, int],
+        inductor_meta: dict[str, Any],
+        triton_meta: dict[str, Any],
+    ) -> list[Config]:
+        """Extra candidates of a looped reduction on a capped grid (CappedGrid1D: at
+        most `grid_cap` programs that loop over its rows), added to the configs from
+        get_configs. The caller asks for them only for such a kernel, which has no y
+        dimension, and checks each config with check_capped_grid_config. Device
+        heuristics may override it.
+
+        The default: XBLOCK 1 with R0_BLOCK 4,096 for rows wider than 2,048 elements and
+        8,192 for rows wider than 4,096 (the row's size hint, a power of 2, is at least
+        the block), with 16 warps on 32-lane GPUs (8 on 64-lane ones). Like the
+        pointwise candidates, they keep more loads in flight in each iteration of a
+        program's loop. No candidates if its rows are strided (the OUTER and OUTER_TINY
+        hints), it has more than one reduction dimension, get_configs' default R0_BLOCK
+        limit is 1,024 (_default_max_r0_block: compute capability 10 or above, or a
+        register-intensive reduction), it has a strict R0_BLOCK
+        (strict_reduction_rblock, which would replace theirs) or its configs are
+        filtered for determinism (one config is then kept without a benchmark, which
+        could be one of these unmeasured candidates).
+        """
+        from torch._inductor.runtime.triton_heuristics import (
+            get_total_reduction_numel,
+            should_filter_reduction_configs_for_determinism,
+            triton_config_reduction,
+        )
+
+        if (
+            "r1_" in size_hints
+            or inductor_meta.get("reduction_hint")
+            in (ReductionHint.OUTER, ReductionHint.OUTER_TINY)
+            or self._default_max_r0_block(size_hints, inductor_meta, triton_meta) < 2048
+            or inductor_meta.get("strict_reduction_rblock") is not None
+            or should_filter_reduction_configs_for_determinism(inductor_meta)
+        ):
+            return []
+        rnumel = get_total_reduction_numel(size_hints)
+        return [
+            triton_config_reduction(
+                size_hints,
+                1,
+                r0_block,
+                num_warps=16,
+                warp_size=triton_meta["device"].warp_size_or_default,
+            )
+            for r0_block in (4096, 8192)
+            if rnumel >= r0_block
+        ]
 
     def get_persistent_configs(
         self,

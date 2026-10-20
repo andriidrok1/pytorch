@@ -160,6 +160,17 @@ class CodegenConfigHeuristics:
     def get_configs(self, *args: Any, **kwargs: Any) -> list[Any]:
         raise NotImplementedError
 
+    def get_capped_grid_configs(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """The candidates of a kernel on a capped grid (CappedGrid1D); none by default.
+
+        Asked only for such a kernel, after its grid_cap and its dimensions (x only) are
+        checked, with the keyword arguments size_hints, inductor_meta and triton_meta,
+        and for the pointwise heuristic also min_elem_per_thread. A non-empty pointwise
+        result replaces the stock configs, and a reduction result is added to them; both
+        callers check each config with check_capped_grid_config.
+        """
+        return []
+
 
 def register_codegen_heuristic(
     name: str,
