@@ -125,6 +125,9 @@ class AllocationTreeNode:
         """Number of bytes needed at runtime"""
         raise NotImplementedError
 
+    def get_aligned_symbolic_size(self) -> sympy.Expr:
+        return align(self.get_symbolic_size())
+
     def finalize(self, pool, offset) -> AllocationTreeNode:
         """Called after all allocations have been made"""
         return self
@@ -234,6 +237,7 @@ class MemorySplitProtocol(Protocol):
     get_live_ranges: CachedMethod[[], LiveRanges]
     get_size_hint: CachedMethod[[], int]
     get_symbolic_size: CachedMethod[[], sympy.Expr]
+    get_aligned_symbolic_size: CachedMethod[[], sympy.Expr]
 
     def _allocate(self, block: Allocation, is_last: bool) -> bool: ...
 
@@ -254,6 +258,7 @@ class ClearCacheOnAllocateMixin(MemorySplitProtocol):
         self.get_live_ranges.clear_cache(self)
         self.get_size_hint.clear_cache(self)
         self.get_symbolic_size.clear_cache(self)
+        self.get_aligned_symbolic_size.clear_cache(self)
 
 
 @dataclasses.dataclass
@@ -327,6 +332,12 @@ class TemporalSplit(ClearCacheOnAllocateMixin, AllocationTreeNode):
             return 0  # type: ignore[return-value]
         return Max(*[x.get_symbolic_size() for x in self.allocations])
 
+    @cache_on_self
+    def get_aligned_symbolic_size(self) -> sympy.Expr:
+        if not self.allocations:
+            return Max(0)
+        return Max(*[x.get_aligned_symbolic_size() for x in self.allocations])
+
     def is_empty(self):
         return len(self.allocations) == 1 and self.allocations[0].is_empty()
 
@@ -375,12 +386,19 @@ class SpatialSplit(ClearCacheOnAllocateMixin, AllocationTreeNode):
 
     @cache_on_self
     def get_symbolic_size(self) -> sympy.Expr:
-        return align(self.left.get_symbolic_size()) + self.right.get_symbolic_size()
+        return self.left.get_aligned_symbolic_size() + self.right.get_symbolic_size()
+
+    @cache_on_self
+    def get_aligned_symbolic_size(self) -> sympy.Expr:
+        return (
+            self.left.get_aligned_symbolic_size()
+            + self.right.get_aligned_symbolic_size()
+        )
 
     def finalize(self, pool, offset):
         self.left = self.left.finalize(pool, offset)
         self.right = self.right.finalize(
-            pool, offset + align(self.left.get_symbolic_size())
+            pool, offset + self.left.get_aligned_symbolic_size()
         )
         self.clear_cache()
         if self.right.is_empty():
