@@ -515,7 +515,7 @@ _scaled_gemm(
       "scaled_addmm: input and output must have the same dtype and leading dimension");
   auto tuning_ctx = at::cuda::tunable::getTuningContext();
   // TunableOp's ScaledGemmParams cannot represent the addmm accumulator/alpha/beta
-  // yet, so bypass it for epilogues (ROCm blocks the accumulator upstream, CUDA-only).
+  // yet, so bypass it for epilogues.
   const bool tunable_supports_epilogue = !effective_accumulator &&
       epilogue.alpha == 1.0f && epilogue.beta == 0.0f;
   bool tunable_op_enabled =
@@ -660,8 +660,29 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
 
   TORCH_CHECK(!scale_result || (scale_result->numel() == 1 && scale_result->scalar_type() == kFloat),
        "scale_result must be a float scalar");
-  TORCH_CHECK(!bias || bias->numel() == mat2.sizes()[1], "Bias must be size ", mat2.sizes()[1],
-       " but got ", bias->numel());
+#ifdef USE_ROCM
+  // Accept output-shaped residuals through the v1 bias argument on ROCm.
+  // Add the residual in the GEMM epilogue before rounding the BF16 output.
+  const bool bias_is_matrix = bias && bias->numel() != mat2.size(1) &&
+      bias->dim() == 2 && bias->size(0) == mat1.size(0) &&
+      bias->size(1) == mat2.size(1);
+#else
+  constexpr bool bias_is_matrix = false;
+#endif
+  TORCH_CHECK(!bias || bias->numel() == mat2.sizes()[1] || bias_is_matrix,
+       "Bias must be size ", mat2.sizes()[1], " or match the output matrix, but got ", bias->sizes());
+  TORCH_CHECK(!bias_is_matrix ||
+      (bias->is_contiguous() &&
+       bias->scalar_type() == out.scalar_type() &&
+       out.scalar_type() == ScalarType::BFloat16 &&
+       scaling_choice_a == ScalingType::RowWise &&
+       scaling_choice_b == ScalingType::RowWise),
+      "ROCm matrix residual requires contiguous BF16 output-shaped bias and rowwise scaling");
+  if (bias_is_matrix) {
+    TORCH_CHECK_VALUE(
+        reinterpret_cast<uintptr_t>(bias->const_data_ptr()) % 16 == 0,
+        "ROCm matrix residual data pointer must be 16-byte aligned");
+  }
   TORCH_CHECK(
       mat1.sizes()[1] % 16 == 0,
       "Expected trailing dimension of mat1 to be divisible by 16 ",
@@ -728,6 +749,9 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
   IntArrayRef mat1_sizes = mat1.sizes();
   IntArrayRef mat2_sizes = mat2.sizes();
   at::native::resize_output(out, {mat1_sizes[0], mat2_sizes[1]});
+  TORCH_CHECK(
+      !bias_is_matrix || out.is_contiguous(),
+      "ROCm matrix residual requires a contiguous row-major output");
 
   // If any of M, K, N is 0 - return early (the tensorwise/rowwise float8 gemm kernels
   // do not support this case).
@@ -736,7 +760,11 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
     // MxK by KxN and K is the zero dim, we need to initialize here to properly
     // return a tensor of zeros.
     if (mat1_sizes[1] == 0) {
-      out.zero_();
+      if (bias_is_matrix) {
+        out.copy_(*bias);
+      } else {
+        out.zero_();
+      }
     }
 
     return out;
@@ -807,7 +835,12 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
 
   // v1 has no swizzle argument, so it can only express the default layout.
   // Callers wanting the gfx950 32x8-tiled scales must use `_scaled_mm_v2`.
-  return _scaled_gemm(mat1, mat2, scale_a, scale_b, scaling_choice_a, scaling_choice_b, SwizzleType::NO_SWIZZLE, SwizzleType::NO_SWIZZLE, bias, use_fast_accum, out, {}, scale_result);
+  ScaledGemmEpilogue epilogue;
+  if (bias_is_matrix) {
+    epilogue.accumulator = bias;
+    epilogue.beta = 1.0f;
+  }
+  return _scaled_gemm(mat1, mat2, scale_a, scale_b, scaling_choice_a, scaling_choice_b, SwizzleType::NO_SWIZZLE, SwizzleType::NO_SWIZZLE, bias_is_matrix ? std::nullopt : bias, use_fast_accum, out, epilogue, scale_result);
 }
 
 Tensor
